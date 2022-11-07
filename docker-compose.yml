@@ -1,14 +1,8 @@
-version: '3.7'
+version: "3.8"
 
 services:
 
-  # The 'setup' service runs a one-off script which initializes the
-  # 'logstash_internal' and 'kibana_system' users inside Elasticsearch with the
-  # values of the passwords defined in the '.env' file.
-  #
-  # This task is only performed during the *initial* startup of the stack. On all
-  # subsequent runs, the service simply returns immediately, without performing
-  # any modification to existing users.
+  # elkstack
   setup:
     build:
       context: setup/
@@ -16,13 +10,13 @@ services:
         ELASTIC_VERSION: ${ELASTIC_VERSION}
     init: true
     volumes:
-      - setup:/state:Z
+      - ./setup:/state:Z
     environment:
       ELASTIC_PASSWORD: ${ELASTIC_PASSWORD:-}
       LOGSTASH_INTERNAL_PASSWORD: ${LOGSTASH_INTERNAL_PASSWORD:-}
       KIBANA_SYSTEM_PASSWORD: ${KIBANA_SYSTEM_PASSWORD:-}
-    networks:
-      - elk
+    # networks:
+    #   - kong-net
     depends_on:
       - elasticsearch
 
@@ -33,7 +27,7 @@ services:
         ELASTIC_VERSION: ${ELASTIC_VERSION}
     volumes:
       - ./elasticsearch/config/elasticsearch.yml:/usr/share/elasticsearch/config/elasticsearch.yml:ro,z
-      - elasticsearch:/usr/share/elasticsearch/data:z
+      - ./elasticsearch:/usr/share/elasticsearch/data:z
     ports:
       - "9200:9200"
       - "9300:9300"
@@ -46,8 +40,8 @@ services:
       # Use single node discovery in order to disable production mode and avoid bootstrap checks.
       # see: https://www.elastic.co/guide/en/elasticsearch/reference/current/bootstrap-checks.html
       discovery.type: single-node
-    networks:
-      - elk
+    # networks:
+    #   - kong-net
 
   logstash:
     build:
@@ -65,8 +59,8 @@ services:
     environment:
       LS_JAVA_OPTS: -Xms256m -Xmx256m
       LOGSTASH_INTERNAL_PASSWORD: ${LOGSTASH_INTERNAL_PASSWORD:-}
-    networks:
-      - elk
+    # networks:
+    #   - kong-net
     depends_on:
       - elasticsearch
 
@@ -83,15 +77,91 @@ services:
       KIBANA_SYSTEM_PASSWORD: ${KIBANA_SYSTEM_PASSWORD:-}
       # Fleet plugin
       KIBANA_FLEET_SETUP: '1'
-    networks:
-      - elk
+    # networks:
+    #   - kong-net
     depends_on:
       - elasticsearch
 
-networks:
-  elk:
-    driver: bridge
+  apm-server:
+    container_name: apm-server
+    image: elastic/apm-server:8.5.0
+    volumes:
+      - ./apm-server/apm-server.docker.yml:/usr/share/apm-server/apm-server.yml:ro
+    ports:
+    - 8200:8200
+    command: >
+       apm-server -e
+         -E apm-server.rum.enabled=true
+         -E setup.kibana.host=kibana:5601
+         -E setup.template.settings.index.number_of_replicas=0
+         -E apm-server.kibana.enabled=true
+         -E apm-server.kibana.host=kibana:5601
+         -E output.elasticsearch.hosts=["elasticsearch:9200"]
 
-volumes:
-  setup:
-  elasticsearch:
+  # OTEL Collector
+  otel-collector:
+    container_name: otel-collector
+    image: otel/opentelemetry-collector
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./opentelemetry/otel-collector-config.yaml:/etc/otel-collector-config.yaml
+    ports:
+      - "1888:1888"   # pprof extension
+      - "8888:8888"   # Prometheus metrics exposed by the collector
+      - "8889:8889"   # Prometheus exporter metrics
+      - "13133:13133" # health_check extension
+      - "4317:4317"   # OTLP gRPC receiver
+      - "4318:4318"   # OTLP http receiver
+      - "55679:55679" # zpages extension
+  
+  # kong gateway
+  kong-gateway:
+    container_name: kong-gateway-db-less
+    image: kong:3.0.0
+    ports:
+      - "8000:8000"
+      - "8443:8443"
+      - "8001:8001"
+      - "8444:8444"
+      - "8002:8002"
+      - "8445:8445"
+      - "8003:8003"
+      - "8004:8004"
+    environment:
+      - KONG_DATABASE=off
+      - KONG_DECLARATIVE_CONFIG=/kong/declarative/kong.yml
+      - KONG_PROXY_ACCESS_LOG=/dev/stdout
+      - KONG_ADMIN_ACCESS_LOG=/dev/stdout
+      - KONG_PROXY_ERROR_LOG=/dev/stderr
+      - KONG_ADMIN_ERROR_LOG=/dev/stderr
+      - KONG_ADMIN_LISTEN=0.0.0.0:8001
+      - KONG_ADMIN_GUI_URL=http://localhost:8002
+      # custom plugin
+      - KONG_PLUGINS=bundled,gohello,file-log-advanced,elastic-apm
+      # lua: 引入自定義的 plugins 路徑 - https://docs.konghq.com/gateway/3.0.x/plugin-development/distribution/  
+      - KONG_LUA_PACKAGE_PATH=/kong/lua-custom-plugins/?.lua;;
+      # golang
+      - KONG_PLUGINSERVER_NAMES=gohello,elastic-apm
+      - KONG_PLUGINSERVER_GOHELLO_SOCKET=/usr/local/kong/gohello.socket
+      - KONG_PLUGINSERVER_GOHELLO_START_CMD=/usr/local/bin/gohello
+      - KONG_PLUGINSERVER_GOHELLO_QUERY_CMD=/usr/local/bin/gohello -dump
+      # APM OTEL
+      - KONG_OPENTELEMETRY_TRACING=all
+      - KONG_OPENTELEMETRY_TRACING_SAMPLING_RATE=1.0
+      # APM go-plugin(go-agent)
+      - KONG_PLUGINSERVER_ELASTIC_APM_SOCKET=/usr/local/kong/elastic-apm.socket
+      - KONG_PLUGINSERVER_ELASTIC_APM_START_CMD=/usr/local/bin/elastic-apm
+      - KONG_PLUGINSERVER_ELASTIC_APM_QUERY_CMD=/usr/local/bin/elastic-apm -dump
+      #other golang plugins: should append name of other plugins after KONG_PLUGINSERVER_NAMES and create whole new nv param as below
+      # - KONG_PLUGINSERVER_otherplugin_SOCKET=/usr/local/kong/otherplugin.socket
+      # - KONG_PLUGINSERVER_otherplugin_START_CMD=/usr/local/bin/otherplugin
+      # - KONG_PLUGINSERVER_otherplugin_QUERY_CMD=/usr/local/bin/otherplugin -dump
+    volumes:
+      - ./declarative/:/kong/declarative/
+      - ./plugins/lua/:/kong/lua-custom-plugins/kong/plugins/
+      - ./plugins/go/gohello:/usr/local/bin/gohello
+      - ./plugins/go/elastic-apm:/usr/local/bin/elastic-apm
+   # command: "kong restart" # or "kong prepare && kong reload"
+networks:
+  default:  
+    name: kong-net
